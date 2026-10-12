@@ -65,6 +65,11 @@ class S3Archiver:
         )
 
 
+def resolve_request_id(incoming: str) -> str:
+    # fullmatch, not match: `$` also matches before a trailing newline, which would let "id\n" through.
+    return incoming if REQUEST_ID_PATTERN.fullmatch(incoming) else str(uuid.uuid4())
+
+
 def validate_event(payload) -> list[str]:
     if not isinstance(payload, dict):
         return ["body must be a JSON object"]
@@ -124,8 +129,7 @@ def create_app(config: dict | None = None, archiver=None) -> Flask:
     @app.before_request
     def _start_timer():
         g.start = time.perf_counter()
-        incoming = request.headers.get("X-Request-ID", "")
-        g.request_id = incoming if REQUEST_ID_PATTERN.match(incoming) else str(uuid.uuid4())
+        g.request_id = resolve_request_id(request.headers.get("X-Request-ID", ""))
 
     @app.after_request
     def _record_metrics(response):

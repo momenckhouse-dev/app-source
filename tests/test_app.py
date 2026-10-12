@@ -1,6 +1,6 @@
 import pytest
 
-from secure_event_api.app import create_app, validate_event
+from secure_event_api.app import create_app, resolve_request_id, validate_event
 
 VALID_EVENT = {"source": "fw-gw-01", "severity": "high", "message": "Blocked outbound C2 beacon"}
 
@@ -123,3 +123,10 @@ def test_echoes_safe_client_request_id(client):
 def test_replaces_unsafe_client_request_id(client, unsafe):
     response = client.get("/healthz", headers={"X-Request-ID": unsafe})
     assert response.headers["X-Request-ID"] != unsafe
+
+
+@pytest.mark.parametrize("unsafe", ["req-1\n", "req-1\r\nforged=1", ""])
+def test_resolve_request_id_rejects_newlines(unsafe):
+    # HTTP clients refuse to send these, so test the validator directly.
+    assert resolve_request_id(unsafe) != unsafe
+    assert resolve_request_id("req-1") == "req-1"
