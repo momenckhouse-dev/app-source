@@ -1,5 +1,7 @@
 # secure-event-api
 
+[![ci](https://github.com/momenckhouse-dev/app-source/actions/workflows/ci.yml/badge.svg)](https://github.com/momenckhouse-dev/app-source/actions/workflows/ci.yml)
+
 Security-event ingestion API for the Secure GitOps Platform. Accepts events over HTTP, validates
 them, archives them to an S3 bucket provisioned through the platform's `SecureService` API, and
 exposes Prometheus metrics.
