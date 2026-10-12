@@ -1,0 +1,188 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: secure-event-api
+  GITOPS_REPO: gitops-config
+
+jobs:
+  test-and-lint-python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Lint Python (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Unit tests
+        run: pytest -q --junitxml=reports/junit.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit
+          path: reports/junit.xml
+
+  lint-dockerfile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+  build-scan-push:
+    needs: [test-and-lint-python, lint-dockerfile]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> AWS STS, no stored access keys
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.push.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute immutable tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (loaded locally, not pushed until scanned)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: local/secure-event-api:${{ steps.meta.outputs.tag }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy vulnerability scan (gate on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: local/secure-event-api:${{ steps.meta.outputs.tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: "1"
+          format: table
+
+      - name: Generate SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: local/secure-event-api:${{ steps.meta.outputs.tag }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          skip-setup-trivy: true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.meta.outputs.tag }}
+          path: sbom.cdx.json
+
+      - name: Configure AWS credentials via OIDC
+        if: github.event_name == 'push' && vars.AWS_CI_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: github.event_name == 'push' && vars.AWS_CI_ROLE_ARN != ''
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push immutable image
+        if: github.event_name == 'push' && vars.AWS_CI_ROLE_ARN != ''
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}"
+          docker tag "local/secure-event-api:${TAG}" "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:${TAG}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${TAG}" | cut -d@ -f2)
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE}:${TAG} (${DIGEST})" >> "$GITHUB_STEP_SUMMARY"
+
+  propose-gitops-update:
+    needs: build-scan-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_CI_ROLE_ARN != '' && vars.GITOPS_BOT_APP_ID != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Mint short-lived token for the config repo
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GITOPS_BOT_APP_ID }}
+          private-key: ${{ secrets.GITOPS_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ env.GITOPS_REPO }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ env.GITOPS_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: imranismail/setup-kustomize@v2
+
+      - name: Pin new image in the staging overlay
+        working-directory: environments/staging
+        run: |
+          kustomize edit set image \
+            secure-event-api=${{ needs.build-scan-push.outputs.image }}:${{ needs.build-scan-push.outputs.tag }}
+
+      - name: Open pull request against the config repo
+        id: pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: release/staging-${{ needs.build-scan-push.outputs.tag }}
+          commit-message: "staging: deploy secure-event-api ${{ needs.build-scan-push.outputs.tag }}"
+          title: "staging: deploy secure-event-api ${{ needs.build-scan-push.outputs.tag }}"
+          labels: release, staging
+          body: |
+            Automated release proposal from `${{ github.repository }}@${{ github.sha }}`.
+
+            | Field | Value |
+            |---|---|
+            | Image | `${{ needs.build-scan-push.outputs.image }}:${{ needs.build-scan-push.outputs.tag }}` |
+            | Digest | `${{ needs.build-scan-push.outputs.digest }}` |
+            | Trivy | passed (no fixable HIGH/CRITICAL) |
+            | SBOM | attached to CI run ${{ github.run_id }} |
+
+            Staging auto-merges once `validate` passes. Production promotion is a separate, approved workflow.
+
+      - name: Enable auto-merge for staging
+        if: steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh pr merge "${{ steps.pr.outputs.pull-request-number }}" \
+            --repo "${{ github.repository_owner }}/${GITOPS_REPO}" --auto --squash
