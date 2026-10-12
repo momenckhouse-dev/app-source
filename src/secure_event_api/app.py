@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ VALID_SEVERITIES = ("low", "medium", "high", "critical")
 REQUIRED_FIELDS = ("source", "severity", "message")
 MAX_MESSAGE_LENGTH = 4096
 FAULT_MODES = ("none", "errors", "latency", "memory_leak")
+# Client-supplied request IDs are echoed into logs, so only accept a safe charset (no log injection).
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 log = logging.getLogger("secure_event_api")
 
@@ -121,6 +124,8 @@ def create_app(config: dict | None = None, archiver=None) -> Flask:
     @app.before_request
     def _start_timer():
         g.start = time.perf_counter()
+        incoming = request.headers.get("X-Request-ID", "")
+        g.request_id = incoming if REQUEST_ID_PATTERN.match(incoming) else str(uuid.uuid4())
 
     @app.after_request
     def _record_metrics(response):
@@ -129,6 +134,8 @@ def create_app(config: dict | None = None, archiver=None) -> Flask:
             elapsed = time.perf_counter() - g.get("start", time.perf_counter())
             request_latency.labels(request.method, endpoint).observe(elapsed)
             requests_total.labels(request.method, endpoint, str(response.status_code)).inc()
+        if "request_id" in g:
+            response.headers["X-Request-ID"] = g.request_id
         return response
 
     @app.get("/healthz")
@@ -175,12 +182,23 @@ def create_app(config: dict | None = None, archiver=None) -> Flask:
                 archiver.archive(event)
             except Exception:
                 archive_failures.inc()
-                log.exception(json.dumps({"msg": "archive failed", "event_id": event["id"]}))
+                log.exception(
+                    json.dumps({"msg": "archive failed", "event_id": event["id"], "request_id": g.request_id})
+                )
                 return jsonify(error="archive unavailable, retry later"), 503
 
         stats[event["severity"]] += 1
         events_total.labels(event["severity"]).inc()
-        log.info(json.dumps({"msg": "event accepted", "id": event["id"], "severity": event["severity"]}))
+        log.info(
+            json.dumps(
+                {
+                    "msg": "event accepted",
+                    "id": event["id"],
+                    "severity": event["severity"],
+                    "request_id": g.request_id,
+                }
+            )
+        )
         return jsonify(id=event["id"]), 201
 
     @app.get("/v1/events/stats")
