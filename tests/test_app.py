@@ -1,6 +1,6 @@
 import pytest
 
-from secure_event_api.app import create_app, validate_event
+from secure_event_api.app import create_app, resolve_request_id, validate_event
 
 VALID_EVENT = {"source": "fw-gw-01", "severity": "high", "message": "Blocked outbound C2 beacon"}
 
@@ -106,3 +106,27 @@ def test_fault_mode_memory_leak_retains_memory():
 def test_unknown_fault_mode_is_rejected():
     with pytest.raises(ValueError):
         create_app({"fault_mode": "chaos"})
+
+
+def test_generates_request_id_when_missing(client):
+    first = client.get("/healthz").headers["X-Request-ID"]
+    second = client.get("/healthz").headers["X-Request-ID"]
+    assert first and second and first != second
+
+
+def test_echoes_safe_client_request_id(client):
+    response = client.post("/v1/events", json=VALID_EVENT, headers={"X-Request-ID": "fw-gw-01.req_42"})
+    assert response.headers["X-Request-ID"] == "fw-gw-01.req_42"
+
+
+@pytest.mark.parametrize("unsafe", ['x", "msg": "forged', "a" * 129, "spaces not allowed"])
+def test_replaces_unsafe_client_request_id(client, unsafe):
+    response = client.get("/healthz", headers={"X-Request-ID": unsafe})
+    assert response.headers["X-Request-ID"] != unsafe
+
+
+@pytest.mark.parametrize("unsafe", ["req-1\n", "req-1\r\nforged=1", ""])
+def test_resolve_request_id_rejects_newlines(unsafe):
+    # HTTP clients refuse to send these, so test the validator directly.
+    assert resolve_request_id(unsafe) != unsafe
+    assert resolve_request_id("req-1") == "req-1"
