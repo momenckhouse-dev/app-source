@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+    # A docs-only change must not build, push and deploy a new release.
+    paths-ignore: ["**.md"]
 
 permissions:
   contents: read
